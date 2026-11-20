@@ -1,0 +1,48 @@
+services:
+  roadsideradiogateway:
+    image: ghcr.io/OWNER/roadsideradiogateway:latest
+    container_name: roadsideradiogateway
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: info
+      DATA_DIR: /data
+      DATABASE_PATH: /data/gateway.sqlite
+      GATEWAY_HOST: 0.0.0.0
+      GATEWAY_PORT: 8005
+      GATEWAY_PUBLIC_URL: https://broadcast.roadsideradio.co.uk:8005
+      ADMIN_HOST: 0.0.0.0
+      ADMIN_PORT: 3000
+      TRUST_PROXY: "false"
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET}
+      BOP_API_KEY: ${BOP_API_KEY:?set BOP_API_KEY}
+      # Internal Liquidsoap harbor target on private Docker network
+      LIQUIDSOAP_HOST: ${LIQUIDSOAP_HOST:-KGM-Liquidsoap}
+      LIQUIDSOAP_PORT: ${LIQUIDSOAP_PORT:-9001}
+      LIQUIDSOAP_MOUNT: ${LIQUIDSOAP_MOUNT:-/presenter}
+      LIQUIDSOAP_USER: ${LIQUIDSOAP_USER:-source}
+      LIQUIDSOAP_PASSWORD: ${LIQUIDSOAP_PASSWORD:?set LIQUIDSOAP_PASSWORD}
+    ports:
+      - "8005:8005"   # Public presenter source endpoint (expose as required)
+      # - "3000:3000" # Management API - keep internal/private; expose only via trusted network/reverse proxy if needed
+    volumes:
+      - gateway-data:/data
+    networks:
+      - default
+      - radio-internal
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  gateway-data:
+
+networks:
+  # Attach to the existing private Docker network used by KGM-Liquidsoap and KGM-Icecast.
+  # Replace 'radio-internal' / external name with your actual network name.
+  radio-internal:
+    external: true
+    name: ${RADIO_INTERNAL_NETWORK:-radio-internal}
