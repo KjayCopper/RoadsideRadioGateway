@@ -149,8 +149,9 @@ Gateway endpoint: **`broadcast.roadsideradio.co.uk`**, port **`8005`**, protocol
 See [`liquidsoap/presenter-gateway.liq`](liquidsoap/presenter-gateway.liq) for the exact snippet. Summary:
 - Bind Harbor on private network only, e.g. port `9001`, mount `/presenter`
 - `presenter_live = input.harbor("presenter", port=9001, user="source", password="...")`
-- `radio = fallback(track_sensitive=false, [presenter_live, autodj])`
+- `radio = fallback([presenter_live, autodj])` (presenter takes priority; AutoDJ resumes when unavailable)
 - Keep existing `output.icecast` to `KGM-Icecast` with public mount `/live` unchanged
+- Presenter stream metadata headers (e.g. `Ice-Name`, `Ice-Description`, `Ice-Genre`, `Ice-URL`, `ice-audio-info`) and Icecast-style now-playing updates (`/admin/metadata?mode=updinfo&mount=...&song=...`) received on port 8005 are forwarded through to Liquidsoap for the live presenter
 - Validate with `liquidsoap --check yourscript.liq`
 
 ## Docker / Cosmos Cloud deployment

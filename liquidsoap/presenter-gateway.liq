@@ -40,11 +40,8 @@ presenter_live = input.harbor(
 # autodj = ... (existing playlist/request queue/fallback source) ...
 
 # Live presenter takes priority; AutoDJ resumes when presenter source is unavailable.
-radio = fallback(
-  id = "presenter_fallback",
-  track_sensitive = false,
-  [presenter_live, autodj]
-)
+# (track_sensitive is not used here for Liquidsoap 2.5.x compatibility; adjust if your script requires it.)
+radio = fallback([presenter_live, autodj])
 
 # --- KEEP YOUR EXISTING PUBLIC OUTPUT UNCHANGED ---
 # Example only (do not duplicate/change your real output):

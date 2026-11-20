@@ -341,3 +341,56 @@ test('gateway restart semantics: queue state is in-memory and cleared on restart
   assert.equal(env.queueManager.snapshot().live, null);
   assert.equal(env.queueManager.snapshot().next, null);
 });
+
+test('source metadata headers and now-playing updates are forwarded to liquidsoap', async (t) => {
+  const harbor = await startFakeLiquidsoapHarbor();
+  const env = await bootstrap({ LIQUIDSOAP_PORT: harbor.port });
+  t.after(async () => { await env.shutdown(); await harbor.close(); });
+
+  const { presenterService } = env.services;
+  const dj = await presenterService.createPresenter({ username: 'metadj', displayName: 'Meta DJ' });
+
+  const conn = await sendSourceRequest({
+    port: env.sourcePort,
+    username: 'metadj',
+    password: dj.password,
+    expectContinue: true,
+    extraHeaders: {
+      'Ice-Name': 'Meta DJ Show',
+      'Ice-Genre': 'Rock',
+      'Ice-Description': 'Testing metadata',
+      'Ice-URL': 'https://roadsideradio.example',
+      'ice-audio-info': 'ice-samplerate=44100;ice-bitrate=128;ice-channels=2',
+    },
+  });
+  assert.equal(conn.statusCode, 200);
+  conn.writeChunk('audio-data');
+  await wait(200);
+
+  const streamReq = harbor.received.find(r => /PUT \/presenter HTTP\/1\.1/i.test(r.headers || '') && !/\/admin\/metadata/i.test(r.headers || ''));
+  assert.ok(streamReq, 'expected forwarded source stream request');
+  assert.match(streamReq.headers, /ice-genre:\s*Rock/i);
+  assert.match(streamReq.headers, /ice-url:\s*https:\/\/roadsideradio\.example/i);
+  assert.match(streamReq.headers, /ice-audio-info:\s*ice-samplerate=44100/i);
+
+  const metaRes = await sendSourceRequest({
+    port: env.sourcePort,
+    method: 'GET',
+    requestTarget: '/admin/metadata?mode=updinfo&mount=/live&song=Test%20Artist%20-%20Test%20Song',
+    username: 'metadj',
+    password: dj.password,
+    contentType: null,
+  });
+  assert.equal(metaRes.statusCode, 200);
+  metaRes.socket.destroy();
+
+  await wait(150);
+  const metaReq = harbor.received.find(r => /\/admin\/metadata/i.test(r.headers || '') || r.isMetadata);
+  assert.ok(metaReq, 'expected forwarded metadata update request');
+  assert.match(metaReq.headers || '', /song=Test(%20|\+)Artist(%20|\+)-(%20|\+)Test(%20|\+)Song/i);
+  assert.match(metaReq.headers || metaReq.path || '', /mount=%2Fpresenter|mount=\/presenter/i);
+
+  try { conn.endStream(); } catch (_) { conn.socket.destroy(); }
+  await wait(150);
+  assert.equal(env.queueManager.snapshot().occupancy, 0);
+});

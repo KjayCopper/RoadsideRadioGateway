@@ -163,5 +163,7 @@ Returns recent gateway/audit events (authentication, connections, queue actions,
 - HTTP Basic authentication using presenter username/password
 - Authentication occurs before queue allocation
 - Responses: **200/100** accepted (live or next), **401** invalid credentials/inactive, **409** duplicate active presenter connection (default), **503** queue full (live+next occupied)
+- Source stream metadata headers (e.g. `Ice-Name`, `Ice-Description`, `Ice-Genre`, `Ice-URL`, `ice-audio-info`) are forwarded to the internal Liquidsoap input for the live stream
+- Now-playing / song metadata updates are accepted on `GET` or `POST` `/admin/metadata` (Icecast-compatible, e.g. `mode=updinfo&mount=...&song=...`) with presenter Basic auth and forwarded to Liquidsoap for the current LIVE presenter
 - Only LIVE audio is forwarded to Liquidsoap; NEXT audio is drained without forwarding/accumulation; queued audio never reaches the public stream
 - On restart, all connections/queue state are cleared

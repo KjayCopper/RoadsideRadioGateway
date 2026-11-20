@@ -5,7 +5,7 @@ const logger = require('../logging/logger');
 const { emit } = require('../services/eventService');
 const queueManager = require('../services/queueManager');
 const { authenticatePresenter, recordConnection } = require('../services/presenterService');
-const { startForwarding } = require('../services/liquidsoapForwarder');
+const { startForwarding, forwardMetadataUpdate } = require('../services/liquidsoapForwarder');
 
 function parseHeaders(raw) {
   const lines = raw.split('\r\n');
@@ -36,13 +36,16 @@ function parseBasicAuth(authHeader) {
 
 function writeStatus(socket, statusCode, statusText, headers = {}, body = '') {
   if (socket.destroyed || socket.writableEnded) return;
+  const payload = Buffer.isBuffer(body) ? body : Buffer.from(body || '', 'utf8');
   const lines = [`HTTP/1.1 ${statusCode} ${statusText}`];
   const allHeaders = { 'Cache-Control': 'no-cache', ...headers };
-  if (body && !allHeaders['Content-Length']) allHeaders['Content-Length'] = Buffer.byteLength(body);
+  if (!Object.prototype.hasOwnProperty.call(allHeaders, 'Content-Length')) allHeaders['Content-Length'] = payload.length;
   if (!allHeaders['Connection']) allHeaders['Connection'] = 'close';
   for (const [k, v] of Object.entries(allHeaders)) lines.push(`${k}: ${v}`);
-  lines.push('', body);
-  try { socket.write(lines.join('\r\n')); } catch (_) {}
+  try {
+    socket.write(lines.join('\r\n') + '\r\n\r\n');
+    if (payload.length) socket.write(payload);
+  } catch (_) {}
 }
 
 function writeContinue(socket) {
@@ -78,6 +81,11 @@ async function handleConnection(socket) {
   let finalResponseSent = false;
   let accepted = false;
 
+  let adminMode = false;
+  let adminBody = Buffer.alloc(0);
+  let adminContentLength = 0;
+  let adminHandled = false;
+
   const sendFinal = (code, text, headers = {}, body = '') => {
     if (finalResponseSent || socket.destroyed) return;
     finalResponseSent = true;
@@ -101,65 +109,201 @@ async function handleConnection(socket) {
     }
   };
 
+  const finalizeAdmin = () => {
+    if (!socket.destroyed) {
+      try { socket.end(); } catch (_) { try { socket.destroy(); } catch (_) {} }
+    }
+  };
+
   socket.on('error', (err) => {
     logger.debug({ err: err.message, remote }, 'source_socket_error');
+    if (adminMode) {
+      adminHandled = true;
+      try { socket.destroy(); } catch (_) {}
+      return;
+    }
     releaseOnce('socket_error');
   });
 
   socket.on('close', () => {
+    if (adminMode) return;
     if (accepted && !finalResponseSent) {
-      // For PUT+Expect flows we may defer final 200 until end; best effort.
       finalResponseSent = true;
     }
     releaseOnce('disconnected');
   });
 
   socket.on('timeout', () => {
+    if (adminMode) {
+      if (!adminHandled && !finalResponseSent) sendFinal(408, 'Request Timeout');
+      finalizeAdmin();
+      return;
+    }
     if (!accepted) cleanup('timeout', { code: 408, text: 'Request Timeout' });
   });
   socket.setTimeout(config.gateway.sourceReadTimeoutMs);
 
   socket.on('data', async (chunk) => {
-    if (!headerParsed) {
-      buffer = Buffer.concat([buffer, chunk]);
-      const idx = buffer.indexOf('\r\n\r\n');
-      if (idx === -1) {
-        if (buffer.length > 64 * 1024) cleanup('headers_too_large', { code: 431, text: 'Request Header Fields Too Large' });
+    try {
+      if (adminMode) {
+        if (adminHandled) return;
+        adminBody = Buffer.concat([adminBody, chunk]);
+        if (adminBody.length >= adminContentLength) {
+          adminHandled = true;
+          const body = adminContentLength > 0 ? adminBody.slice(0, adminContentLength) : Buffer.alloc(0);
+          await handleAdminMetadataRequest({ socket, request, body, remote, sendFinal });
+          finalizeAdmin();
+        } else if (adminBody.length > 1024 * 1024) {
+          adminHandled = true;
+          if (!finalResponseSent) sendFinal(413, 'Payload Too Large');
+          finalizeAdmin();
+        }
         return;
       }
-      headerParsed = true;
-      const headerPart = buffer.slice(0, idx).toString('utf8');
-      const rest = buffer.slice(idx + 4);
-      buffer = Buffer.alloc(0);
-      request = parseHeaders(headerPart);
 
-      const outcome = await processRequest({ socket, request, rest, remote, sendFinal });
-      if (!outcome || !outcome.accepted) {
-        // processRequest handles response/cleanup for rejection paths
-        if (outcome && outcome.cleanupReason && !socket.destroyed) cleanup(outcome.cleanupReason);
+      if (!headerParsed) {
+        buffer = Buffer.concat([buffer, chunk]);
+        const idx = buffer.indexOf('\r\n\r\n');
+        if (idx === -1) {
+          if (buffer.length > 64 * 1024) cleanup('headers_too_large', { code: 431, text: 'Request Header Fields Too Large' });
+          return;
+        }
+        headerParsed = true;
+        const headerPart = buffer.slice(0, idx).toString('utf8');
+        const rest = buffer.slice(idx + 4);
+        buffer = Buffer.alloc(0);
+        request = parseHeaders(headerPart);
+
+        const method = (request.method || '').toUpperCase();
+        const reqPath = (request.requestTarget || '/').split('?')[0].replace(/\/+$/, '') || '/';
+        if ((method === 'GET' || method === 'POST') && reqPath.toLowerCase() === '/admin/metadata') {
+          adminMode = true;
+          socket.setTimeout(10000);
+          adminBody = Buffer.from(rest);
+          adminContentLength = Math.max(0, parseInt(request.headers['content-length'] || '0', 10) || 0);
+          if (method === 'GET' || adminBody.length >= adminContentLength) {
+            adminHandled = true;
+            const body = method === 'POST' && adminContentLength > 0 ? adminBody.slice(0, adminContentLength) : Buffer.alloc(0);
+            await handleAdminMetadataRequest({ socket, request, body, remote, sendFinal });
+            finalizeAdmin();
+          } else if (adminBody.length > 1024 * 1024) {
+            adminHandled = true;
+            if (!finalResponseSent) sendFinal(413, 'Payload Too Large');
+            finalizeAdmin();
+          }
+          return;
+        }
+
+        const outcome = await processRequest({ socket, request, rest, remote, sendFinal });
+        if (!outcome || !outcome.accepted) {
+          if (outcome && outcome.cleanupReason && !socket.destroyed) cleanup(outcome.cleanupReason);
+          return;
+        }
+        accepted = true;
+        slot = outcome.slot;
+        audioStream = outcome.audioStream;
+        blackhole = outcome.blackhole;
+        forwardingRef = outcome.forwardingRef || null;
+        socket.setTimeout(0);
         return;
       }
-      accepted = true;
-      slot = outcome.slot;
-      audioStream = outcome.audioStream;
-      blackhole = outcome.blackhole;
-      forwardingRef = outcome.forwardingRef || null;
-      socket.setTimeout(0); // streaming can be long-lived
-      return;
-    }
 
-    if (audioStream) {
-      if (!audioStream.write(chunk)) {
-        socket.pause();
-        audioStream.once('drain', () => { try { socket.resume(); } catch (_) {} });
+      if (audioStream) {
+        if (!audioStream.write(chunk)) {
+          socket.pause();
+          audioStream.once('drain', () => { try { socket.resume(); } catch (_) {} });
+        }
+      }
+    } catch (err) {
+      logger.error({ err: err.message, remote }, 'source_data_handler_error');
+      if (adminMode) {
+        if (!adminHandled && !finalResponseSent) sendFinal(500, 'Internal Server Error');
+        finalizeAdmin();
+      } else {
+        cleanup('handler_error', { code: 500, text: 'Internal Server Error' });
       }
     }
   });
 
   socket.on('end', () => {
+    if (adminMode) {
+      if (!adminHandled) {
+        adminHandled = true;
+        const body = adminContentLength > 0 ? adminBody.slice(0, Math.min(adminBody.length, adminContentLength)) : adminBody;
+        handleAdminMetadataRequest({ socket, request, body, remote, sendFinal })
+          .catch(() => { if (!finalResponseSent) sendFinal(500, 'Internal Server Error'); })
+          .finally(() => finalizeAdmin());
+      }
+      return;
+    }
     try { if (audioStream) audioStream.end(); } catch (_) {}
     releaseOnce('client_end');
   });
+}
+
+async function handleAdminMetadataRequest({ socket, request, body, remote, sendFinal }) {
+  const method = (request.method || '').toUpperCase();
+  const target = request.requestTarget || '/admin/metadata';
+  const headers = request.headers || {};
+  const pathOnly = target.split('?')[0] || '/admin/metadata';
+
+  const creds = parseBasicAuth(headers['authorization']);
+  if (!creds) {
+    sendFinal(401, 'Unauthorized', { 'WWW-Authenticate': 'Basic realm="RoadsideRadioGateway"', 'Content-Type': 'text/plain; charset=utf-8' }, 'Unauthorized');
+    return;
+  }
+
+  const auth = await authenticatePresenter(creds.username, creds.password);
+  if (!auth.ok) {
+    sendFinal(401, 'Unauthorized', { 'WWW-Authenticate': 'Basic realm="RoadsideRadioGateway"', 'Content-Type': 'text/plain; charset=utf-8' }, 'Unauthorized');
+    return;
+  }
+
+  const presenter = auth.presenter;
+  const live = queueManager.live;
+  if (!live || live.presenter.id !== presenter.id) {
+    sendFinal(409, 'Conflict', { 'Content-Type': 'text/plain; charset=utf-8' }, 'Metadata updates are accepted only for the live presenter');
+    return;
+  }
+
+  // For POST, allow form params in body to inform logging, but proxy as-is; mount override happens in forwarder.
+  let song = null;
+  try {
+    const parsed = new URL(target, 'http://localhost');
+    song = parsed.searchParams.get('song');
+    if (!song && body && body.length && /application\/x-www-form-urlencoded/i.test(headers['content-type'] || '')) {
+      const form = new URLSearchParams(body.toString('utf8'));
+      song = form.get('song');
+    }
+  } catch (_) {}
+
+  const result = await forwardMetadataUpdate({
+    requestMethod: method,
+    requestTarget: target,
+    sourceHeaders: headers,
+    body: method === 'POST' ? body : null,
+  });
+
+  if (result.ok) {
+    emit('metadata_updated', {
+      message: 'Presenter metadata update forwarded',
+      presenterId: presenter.id,
+      username: presenter.username,
+      details: { path: pathOnly, song: song ? String(song).slice(0, 200) : null, proxiedStatus: result.statusCode },
+    });
+    const resHeaders = { 'Content-Type': result.headers['content-type'] || 'text/xml; charset=utf-8', 'Connection': 'close' };
+    sendFinal(200, 'OK', resHeaders, result.body && result.body.length ? result.body : '<?xml version="1.0"?><icestats><message>Metadata update successful</message><return>1</return></icestats>');
+  } else {
+    emit('gateway_error', {
+      level: 'warn',
+      message: 'Failed to forward presenter metadata update',
+      presenterId: presenter.id,
+      username: presenter.username,
+      details: { path: pathOnly, proxiedStatus: result.statusCode },
+    });
+    const status = result.statusCode >= 400 ? result.statusCode : 502;
+    sendFinal(status, status === 504 ? 'Gateway Timeout' : 'Bad Gateway', { 'Content-Type': 'text/plain; charset=utf-8' }, result.body && result.body.length ? result.body : 'Failed to forward metadata update');
+  }
 }
 
 async function processRequest({ socket, request, rest, remote, sendFinal }) {
@@ -172,7 +316,7 @@ async function processRequest({ socket, request, rest, remote, sendFinal }) {
   emit('incoming_connection', { message: 'Incoming presenter connection', details: { remote, method, mountpoint, userAgent: headers['user-agent'] || null, contentType: headers['content-type'] || null } });
 
   if (method !== 'PUT' && method !== 'SOURCE') {
-    sendFinal(405, 'Method Not Allowed', { Allow: 'PUT, SOURCE' });
+    sendFinal(405, 'Method Not Allowed', { Allow: 'PUT, SOURCE, GET, POST' });
     return { accepted: false, cleanupReason: 'method_not_allowed' };
   }
 
@@ -212,6 +356,7 @@ async function processRequest({ socket, request, rest, remote, sendFinal }) {
       contentType: headers['content-type'] || 'audio/mpeg',
       mountpoint,
       userAgent: headers['user-agent'] || null,
+      sourceHeaders: headers,
       sourceStream: audioStream,
       onClose: (err, reason) => {
         if (err) logger.error({ err: err.message, reason, presenterId: presenter.id }, 'forwarding_closed_with_error');
@@ -244,22 +389,14 @@ async function processRequest({ socket, request, rest, remote, sendFinal }) {
 
   slotRef = reservation.slot;
 
-  // Initial body bytes after headers
   if (rest && rest.length) audioStream.write(rest);
 
-  // Acknowledge accepted stream so encoders can proceed to send audio.
-  if (expectContinue) {
-    // Some clients expect 100 then proceed; others accept 200 directly. Send 200 as clear acceptance.
-    // (We avoided sending 100 earlier for the accepted path to keep response simple.)
-  }
   sendFinal(200, 'OK', { Server: 'RoadsideRadioGateway', Connection: 'close' });
 
   if (reservation.role === 'live') {
-    // Forward immediately
     audioStream.resume();
     startForwardingNow();
   } else {
-    // NEXT: keep connection alive and discard audio without accumulating delay
     audioStream.pipe(blackhole);
     audioStream.resume();
     logger.info({ presenterId: presenter.id, username: presenter.username }, 'presenter_connected_as_next_draining');

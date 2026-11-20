@@ -64,7 +64,7 @@ See root `docker-compose.yml`. Replace `OWNER`, external network name, and secre
 1. Merge `liquidsoap/presenter-gateway.liq` into the existing Liquidsoap script without changing the existing Icecast output/public `/live` mount or AutoDJ behavior.
 2. Set harbor password/user/port/mount to match gateway env (`LIQUIDSOAP_*`).
 3. Ensure harbor bind is private (not publicly exposed) and reachable from gateway container.
-4. Keep `fallback(track_sensitive=false, [presenter_live, autodj])` so presenter overrides AutoDJ and AutoDJ resumes when unavailable.
+4. Keep `fallback([presenter_live, autodj])` so presenter overrides AutoDJ and AutoDJ resumes when unavailable (use this form for Liquidsoap 2.5.x compatibility unless your script requires different options). Also ensure presenter metadata/now-playing updates can flow: the gateway forwards source stream metadata headers and Icecast `/admin/metadata` updates for the live presenter to the internal harbor mount.
 5. Validate syntax: `liquidsoap --check /path/to/script.liq`
 6. Reload/restart Liquidsoap per your operational process.
 
